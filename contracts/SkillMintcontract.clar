@@ -262,3 +262,82 @@
             expires-at: (+ stacks-block-height SKILL_DECAY_BLOCKS)
         }))
         (ok true)))
+
+
+;; read only functions
+
+;; Get lesson plan details
+(define-read-only (get-lesson-plan (lesson-id uint))
+    (map-get? lesson-plans lesson-id))
+
+;; Get skill certificate details
+(define-read-only (get-skill-certificate (certificate-id uint))
+    (map-get? skill-certificates certificate-id))
+
+;; Get user's progress on a lesson
+(define-read-only (get-user-progress (user principal) (lesson-id uint))
+    (map-get? user-progress {user: user, lesson-id: lesson-id}))
+
+;; Get peer review details
+(define-read-only (get-peer-review (review-id uint))
+    (map-get? peer-reviews review-id))
+
+;; Get bounty details
+(define-read-only (get-bounty (bounty-id uint))
+    (map-get? skill-bounties bounty-id))
+
+;; Check if skill is still valid (not expired)
+(define-read-only (is-skill-valid (certificate-id uint))
+    (match (map-get? skill-certificates certificate-id)
+        certificate (> (get expires-at certificate) stacks-block-height)
+        false))
+
+;; Get user's valid certifications
+(define-read-only (get-user-valid-skills (user principal))
+    (ok true)) ;; Simplified - would iterate through user's certificates
+
+;; NFT trait implementations
+(define-read-only (get-last-token-id)
+    (ok (- (var-get next-certificate-id) u1)))
+
+(define-read-only (get-token-uri (token-id uint))
+    (ok (some (concat "https://skillmint.com/certificate/" (uint-to-ascii token-id)))))
+
+(define-read-only (get-owner (token-id uint))
+    (ok (nft-get-owner? skill-certificate token-id)))
+
+;; private functions
+
+;; Finalize certification after sufficient peer reviews
+(define-private (finalize-certification (certificate-id uint))
+    (let ((certificate (unwrap! (map-get? skill-certificates certificate-id) ERR_NOT_FOUND)))
+        (let ((avg-score (calculate-average-score (get peer-reviews certificate))))
+            (if (>= avg-score PASSING_SCORE)
+                (begin
+                    (map-set skill-certificates certificate-id (merge certificate {
+                        skill-level: avg-score,
+                        average-score: avg-score
+                    }))
+                    (nft-mint? skill-certificate certificate-id (get owner certificate)))
+                (ok true)))))
+
+;; Calculate average score from peer reviews
+(define-private (calculate-average-score (review-ids (list 10 uint)))
+    (if (is-eq (len review-ids) u0)
+        u0
+        (let ((total-score (fold + review-ids u0)))
+            (/ total-score (len review-ids)))))
+
+;; Check if user has a valid skill certification
+(define-private (has-valid-skill (skill (string-ascii 64)) (user principal))
+    ;; Simplified implementation - would search through user's certificates
+    true)
+
+;; Check if user has all required skills for bounty
+(define-private (has-all-skills (skills (list 10 (string-ascii 64))) (user principal))
+    ;; Simplified implementation - would verify each skill
+    true)
+
+;; Helper function for fold operations
+(define-private (+ (a uint) (b uint))
+    (+ a b))
