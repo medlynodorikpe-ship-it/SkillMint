@@ -30,16 +30,26 @@
 (define-constant ERR_INVALID_BOUNTY (err u106))
 (define-constant ERR_ALREADY_REVIEWED (err u107))
 (define-constant ERR_SELF_REVIEW (err u108))
+(define-constant ERR_CONTRACT_PAUSED (err u109))
+(define-constant ERR_RATE_LIMIT_EXCEEDED (err u110))
+(define-constant ERR_OVERFLOW (err u111))
+(define-constant ERR_UNDERFLOW (err u112))
+(define-constant ERR_INVALID_INPUT (err u113))
 
 (define-constant SKILL_DECAY_BLOCKS u144000) ;; ~100 days assuming 1 block per minute
 (define-constant MIN_REVIEWS_REQUIRED u3)
 (define-constant PASSING_SCORE u70)
+
+;; Rate limiting constants
+(define-constant RATE-LIMIT-BLOCKS u10)
+(define-constant MAX-OPERATIONS-PER-BLOCK u5)
 
 ;; data vars
 (define-data-var next-lesson-id uint u1)
 (define-data-var next-certificate-id uint u1)
 (define-data-var next-bounty-id uint u1)
 (define-data-var platform-fee uint u5) ;; 5% platform fee
+(define-data-var contract-paused bool false)
 
 ;; data maps
 (define-map lesson-plans uint {
@@ -94,6 +104,63 @@
 
 (define-map composite-skills {skill1: (string-ascii 64), skill2: (string-ascii 64)} (string-ascii 64))
 
+(define-map last-operation-block principal uint)
+(define-map operations-per-block {user: principal, block: uint} uint)
+
+;; Security helper functions
+(define-private (safe-add (a uint) (b uint))
+  (let ((result (+ a b)))
+    (asserts! (>= result a) ERR_OVERFLOW)
+    (ok result)
+  )
+)
+
+(define-private (safe-sub (a uint) (b uint))
+  (if (>= a b)
+    (ok (- a b))
+    ERR_UNDERFLOW
+  )
+)
+
+(define-private (safe-mul (a uint) (b uint))
+  (let ((result (* a b)))
+    (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) ERR_OVERFLOW)
+    (ok result)
+  )
+)
+
+(define-private (check-rate-limit (user principal))
+  (let (
+    (current-block stacks-block-height)
+    (last-block (default-to u0 (map-get? last-operation-block user)))
+    (ops-count (default-to u0 (map-get? operations-per-block {user: user, block: current-block})))
+  )
+    (asserts! 
+      (or 
+        (>= (- current-block last-block) RATE-LIMIT-BLOCKS)
+        (< ops-count MAX-OPERATIONS-PER-BLOCK)
+      )
+      ERR_RATE_LIMIT_EXCEEDED
+    )
+    (map-set last-operation-block user current-block)
+    (map-set operations-per-block {user: user, block: current-block} (+ ops-count u1))
+    (ok true)
+  )
+)
+
+(define-private (validate-string-not-empty-128 (str (string-ascii 128)))
+  (if (> (len str) u0)
+    (ok true)
+    ERR_INVALID_INPUT
+  )
+)
+
+(define-private (validate-string-not-empty-64 (str (string-ascii 64)))
+  (if (> (len str) u0)
+    (ok true)
+    ERR_INVALID_INPUT
+  )
+)
 
 ;; Private functions
 (define-private (calculate-average-score (review-ids (list 10 uint)))
@@ -126,6 +193,23 @@
 
 ;; public functions
 
+;; Pause/unpause contract (owner only)
+(define-public (pause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused true)
+    (ok true)
+  )
+)
+
+(define-public (unpause-contract)
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+    (var-set contract-paused false)
+    (ok true)
+  )
+)
+
 ;; Create a new micro-learning lesson plan
 (define-public (create-lesson-plan (title (string-ascii 128)) 
                                   (description (string-ascii 512))
@@ -133,6 +217,10 @@
                                   (difficulty uint)
                                   (price uint))
     (let ((lesson-id (var-get next-lesson-id)))
+        (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (try! (check-rate-limit tx-sender))
+        (try! (validate-string-not-empty-128 title))
+        (try! (validate-string-not-empty-64 skill-category))
         (asserts! (and (>= difficulty u1) (<= difficulty u5)) ERR_INVALID_SKILL_LEVEL)
         (map-set lesson-plans lesson-id {
             creator: tx-sender,
@@ -144,13 +232,14 @@
             completion-count: u0,
             created-at: stacks-block-height
         })
-        (var-set next-lesson-id (+ lesson-id u1))
+        (var-set next-lesson-id (unwrap! (safe-add lesson-id u1) ERR_OVERFLOW))
         (try! (nft-mint? lesson-plan lesson-id tx-sender))
         (ok lesson-id)))
 
 ;; Complete a lesson and record progress
 (define-public (complete-lesson (lesson-id uint) (score uint))
     (let ((lesson (unwrap! (map-get? lesson-plans lesson-id) ERR_NOT_FOUND)))
+        (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
         (asserts! (and (>= score u1) (<= score u100)) ERR_INVALID_SKILL_LEVEL)
         (map-set user-progress {user: tx-sender, lesson-id: lesson-id} {
             completed: true,
@@ -158,7 +247,7 @@
             completed-at: stacks-block-height
         })
         (map-set lesson-plans lesson-id (merge lesson {
-            completion-count: (+ (get completion-count lesson) u1)
+            completion-count: (unwrap! (safe-add (get completion-count lesson) u1) ERR_OVERFLOW)
         }))
         (ok true)))
 
@@ -166,6 +255,9 @@
 (define-public (submit-skill-certification (skill-category (string-ascii 64))
                                           (lessons-completed (list 50 uint)))
     (let ((certificate-id (var-get next-certificate-id)))
+        (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (try! (check-rate-limit tx-sender))
+        (try! (validate-string-not-empty-64 skill-category))
         (asserts! (> (len lessons-completed) u0) ERR_NOT_FOUND)
         (map-set skill-certificates certificate-id {
             owner: tx-sender,
@@ -175,10 +267,10 @@
             peer-reviews: (list),
             average-score: u0,
             certified-at: stacks-block-height,
-            expires-at: (+ stacks-block-height SKILL_DECAY_BLOCKS),
+            expires-at: (unwrap! (safe-add stacks-block-height SKILL_DECAY_BLOCKS) ERR_OVERFLOW),
             is-composite: false
         })
-        (var-set next-certificate-id (+ certificate-id u1))
+        (var-set next-certificate-id (unwrap! (safe-add certificate-id u1) ERR_OVERFLOW))
         (ok certificate-id)))
 
 ;; Peer review a skill demonstration
@@ -186,7 +278,9 @@
                                   (score uint) 
                                   (feedback (string-ascii 256)))
     (let ((certificate (unwrap! (map-get? skill-certificates certificate-id) ERR_NOT_FOUND))
-          (review-id (+ certificate-id (* u1000000 (len (get peer-reviews certificate))))))
+          (review-id (unwrap! (safe-add certificate-id (unwrap! (safe-mul u1000000 (len (get peer-reviews certificate))) ERR_OVERFLOW)) ERR_OVERFLOW)))
+        (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (try! (check-rate-limit tx-sender))
         (asserts! (not (is-eq tx-sender (get owner certificate))) ERR_SELF_REVIEW)
         (asserts! (is-none (map-get? user-reviews {reviewer: tx-sender, certificate-id: certificate-id})) ERR_ALREADY_REVIEWED)
         (asserts! (and (>= score u1) (<= score u100)) ERR_INVALID_SKILL_LEVEL)
@@ -216,6 +310,11 @@
                                       (skill2 (string-ascii 64))
                                       (composite-name (string-ascii 64)))
     (let ((certificate-id (var-get next-certificate-id)))
+        (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (try! (check-rate-limit tx-sender))
+        (try! (validate-string-not-empty-64 skill1))
+        (try! (validate-string-not-empty-64 skill2))
+        (try! (validate-string-not-empty-64 composite-name))
         ;; Verify user has both skills and they're not expired
         (asserts! (has-valid-skill skill1 tx-sender) ERR_NOT_FOUND)
         (asserts! (has-valid-skill skill2 tx-sender) ERR_NOT_FOUND)
@@ -229,14 +328,14 @@
             peer-reviews: (list),
             average-score: u100,
             certified-at: stacks-block-height,
-            expires-at: (+ stacks-block-height SKILL_DECAY_BLOCKS),
+            expires-at: (unwrap! (safe-add stacks-block-height SKILL_DECAY_BLOCKS) ERR_OVERFLOW),
             is-composite: true
         })
         
         ;; Record the composite skill mapping
         (map-set composite-skills {skill1: skill1, skill2: skill2} composite-name)
         
-        (var-set next-certificate-id (+ certificate-id u1))
+        (var-set next-certificate-id (unwrap! (safe-add certificate-id u1) ERR_OVERFLOW))
         (try! (nft-mint? skill-certificate certificate-id tx-sender))
         (ok certificate-id)))
 
@@ -246,6 +345,9 @@
                                    (required-skills (list 10 (string-ascii 64)))
                                    (reward-amount uint))
     (let ((bounty-id (var-get next-bounty-id)))
+        (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (try! (check-rate-limit tx-sender))
+        (try! (validate-string-not-empty-128 title))
         (asserts! (> reward-amount u0) ERR_INVALID_BOUNTY)
         (asserts! (> (len required-skills) u0) ERR_INVALID_BOUNTY)
         
@@ -263,7 +365,7 @@
             created-at: stacks-block-height
         })
         
-        (var-set next-bounty-id (+ bounty-id u1))
+        (var-set next-bounty-id (unwrap! (safe-add bounty-id u1) ERR_OVERFLOW))
         (ok bounty-id)))
 
 ;; Claim bounty if user has required skills
@@ -285,12 +387,13 @@
 ;; Refresh expired skill certification
 (define-public (refresh-certification (certificate-id uint))
     (let ((certificate (unwrap! (map-get? skill-certificates certificate-id) ERR_NOT_FOUND)))
+        (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
         (asserts! (is-eq tx-sender (get owner certificate)) ERR_NOT_AUTHORIZED)
         (asserts! (<= (get expires-at certificate) stacks-block-height) ERR_NOT_AUTHORIZED)
         
         ;; Reset expiration date
         (map-set skill-certificates certificate-id (merge certificate {
-            expires-at: (+ stacks-block-height SKILL_DECAY_BLOCKS)
+            expires-at: (unwrap! (safe-add stacks-block-height SKILL_DECAY_BLOCKS) ERR_OVERFLOW)
         }))
         (ok true)))
 
@@ -326,6 +429,19 @@
 ;; Get user's valid certifications
 (define-read-only (get-user-valid-skills (user principal))
     (ok true)) ;; Simplified - would iterate through user's certificates
+
+;; NEW: Security read-only functions
+(define-read-only (is-contract-paused)
+  (var-get contract-paused)
+)
+
+(define-read-only (get-last-operation-block (user principal))
+  (default-to u0 (map-get? last-operation-block user))
+)
+
+(define-read-only (get-operations-count (user principal) (block uint))
+  (default-to u0 (map-get? operations-per-block {user: user, block: block}))
+)
 
 ;; NFT trait implementations
 (define-read-only (get-last-token-id)
