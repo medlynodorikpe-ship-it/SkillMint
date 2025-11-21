@@ -35,6 +35,12 @@
 (define-constant ERR_OVERFLOW (err u111))
 (define-constant ERR_UNDERFLOW (err u112))
 (define-constant ERR_INVALID_INPUT (err u113))
+;; Additional security error constants
+(define-constant ERR-REENTRANCY (err u114))
+(define-constant ERR-EMERGENCY-WITHDRAWAL (err u115))
+(define-constant ERR-BLACKLISTED (err u116))
+(define-constant ERR-INVALID-CONTENT-HASH (err u117))
+(define-constant ERR-INVALID-CULTURAL-REGION (err u118))
 
 (define-constant SKILL_DECAY_BLOCKS u144000) ;; ~100 days assuming 1 block per minute
 (define-constant MIN_REVIEWS_REQUIRED u3)
@@ -44,12 +50,22 @@
 (define-constant RATE-LIMIT-BLOCKS u10)
 (define-constant MAX-OPERATIONS-PER-BLOCK u5)
 
+;; Security constants
+(define-constant MAX-BATCH-SIZE u10)
+(define-constant MIN-STAKE-AMOUNT u100)
+
 ;; data vars
 (define-data-var next-lesson-id uint u1)
 (define-data-var next-certificate-id uint u1)
 (define-data-var next-bounty-id uint u1)
 (define-data-var platform-fee uint u5) ;; 5% platform fee
 (define-data-var contract-paused bool false)
+
+;; Security data vars
+(define-data-var emergency-mode bool false)
+(define-data-var min-reviews-required uint u3)
+(define-data-var max-stake-amount uint u1000000)
+(define-data-var reentrancy-guard bool false)
 
 ;; data maps
 (define-map lesson-plans uint {
@@ -107,6 +123,33 @@
 (define-map last-operation-block principal uint)
 (define-map operations-per-block {user: principal, block: uint} uint)
 
+;; Security maps
+(define-map authorized-admins principal bool)
+(define-map blacklisted-users principal bool)
+(define-map lesson-moderator-count uint uint)
+
+;; Performance optimization: Batch lesson creation
+(define-map batch-lesson-cache uint {
+    title: (string-ascii 128),
+    description: (string-ascii 512),
+    skill-category: (string-ascii 64),
+    difficulty: uint,
+    price: uint
+})
+
+;; Performance optimization: Enhanced skill validation with caching
+(define-map skill-validation-cache {user: principal, skill: (string-ascii 64)} {
+    is-valid: bool,
+    last-checked: uint,
+    expires-at: uint
+})
+
+;; Performance optimization: Efficient lesson search by category
+(define-map category-lesson-index {category: (string-ascii 64), lesson-id: uint} bool)
+
+;; Initialize contract owner as admin
+(map-set authorized-admins CONTRACT_OWNER true)
+
 ;; Security helper functions
 (define-private (safe-add (a uint) (b uint))
   (let ((result (+ a b)))
@@ -126,6 +169,37 @@
   (let ((result (* a b)))
     (asserts! (or (is-eq b u0) (is-eq (/ result b) a)) ERR_OVERFLOW)
     (ok result)
+  )
+)
+
+;; Security helper functions
+(define-private (check-reentrancy)
+  (begin
+    (asserts! (not (var-get reentrancy-guard)) ERR-REENTRANCY)
+    (var-set reentrancy-guard true)
+    (ok true)
+  )
+)
+
+(define-private (clear-reentrancy)
+  (begin
+    (var-set reentrancy-guard false)
+    (ok true)
+  )
+)
+
+(define-private (is-admin (user principal))
+  (default-to false (map-get? authorized-admins user))
+)
+
+(define-private (is-blacklisted (user principal))
+  (default-to false (map-get? blacklisted-users user))
+)
+
+(define-private (validate-admin-caller)
+  (if (is-admin tx-sender)
+    (ok true)
+    ERR_NOT_AUTHORIZED
   )
 )
 
@@ -210,6 +284,95 @@
   )
 )
 
+;; Emergency mode functions (admin only)
+(define-public (enable-emergency-mode)
+  (begin
+    (try! (validate-admin-caller))
+    (var-set emergency-mode true)
+    (ok true)
+  )
+)
+
+(define-public (disable-emergency-mode)
+  (begin
+    (try! (validate-admin-caller))
+    (var-set emergency-mode false)
+    (ok true)
+  )
+)
+
+(define-public (emergency-withdraw (amount uint))
+  (begin
+    (try! (validate-admin-caller))
+    (asserts! (var-get emergency-mode) ERR-EMERGENCY-WITHDRAWAL)
+    (as-contract (stx-transfer? amount tx-sender CONTRACT_OWNER))
+  )
+)
+
+;; Admin management functions
+(define-public (add-admin (new-admin principal))
+  (begin
+    (try! (validate-admin-caller))
+    (asserts! (not (is-eq new-admin CONTRACT_OWNER)) ERR_NOT_AUTHORIZED)
+    (map-set authorized-admins new-admin true)
+    (ok true)
+  )
+)
+
+(define-public (remove-admin (admin principal))
+  (begin
+    (try! (validate-admin-caller))
+    (asserts! (not (is-eq admin CONTRACT_OWNER)) ERR_NOT_AUTHORIZED)
+    (map-delete authorized-admins admin)
+    (ok true)
+  )
+)
+
+;; Blacklist management functions
+(define-public (blacklist-user (user principal))
+  (begin
+    (try! (validate-admin-caller))
+    (asserts! (not (is-eq user CONTRACT_OWNER)) ERR_NOT_AUTHORIZED)
+    (map-set blacklisted-users user true)
+    (ok true)
+  )
+)
+
+(define-public (remove-from-blacklist (user principal))
+  (begin
+    (try! (validate-admin-caller))
+    (map-delete blacklisted-users user)
+    (ok true)
+  )
+)
+
+;; Configuration update functions
+(define-public (update-min-reviews (new-min uint))
+  (begin
+    (try! (validate-admin-caller))
+    (asserts! (> new-min u0) ERR_INVALID_INPUT)
+    (var-set min-reviews-required new-min)
+    (ok true)
+  )
+)
+
+(define-public (update-max-stake (new-max uint))
+  (begin
+    (try! (validate-admin-caller))
+    (var-set max-stake-amount new-max)
+    (ok true)
+  )
+)
+
+(define-public (update-platform-fee (new-fee uint))
+  (begin
+    (try! (validate-admin-caller))
+    (asserts! (<= new-fee u100) ERR_INVALID_INPUT)
+    (var-set platform-fee new-fee)
+    (ok true)
+  )
+)
+
 ;; Create a new micro-learning lesson plan
 (define-public (create-lesson-plan (title (string-ascii 128)) 
                                   (description (string-ascii 512))
@@ -218,6 +381,7 @@
                                   (price uint))
     (let ((lesson-id (var-get next-lesson-id)))
         (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (not (is-blacklisted tx-sender)) ERR-BLACKLISTED)
         (try! (check-rate-limit tx-sender))
         (try! (validate-string-not-empty-128 title))
         (try! (validate-string-not-empty-64 skill-category))
@@ -240,6 +404,7 @@
 (define-public (complete-lesson (lesson-id uint) (score uint))
     (let ((lesson (unwrap! (map-get? lesson-plans lesson-id) ERR_NOT_FOUND)))
         (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (not (is-blacklisted tx-sender)) ERR-BLACKLISTED)
         (asserts! (and (>= score u1) (<= score u100)) ERR_INVALID_SKILL_LEVEL)
         (map-set user-progress {user: tx-sender, lesson-id: lesson-id} {
             completed: true,
@@ -256,6 +421,7 @@
                                           (lessons-completed (list 50 uint)))
     (let ((certificate-id (var-get next-certificate-id)))
         (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (not (is-blacklisted tx-sender)) ERR-BLACKLISTED)
         (try! (check-rate-limit tx-sender))
         (try! (validate-string-not-empty-64 skill-category))
         (asserts! (> (len lessons-completed) u0) ERR_NOT_FOUND)
@@ -280,6 +446,7 @@
     (let ((certificate (unwrap! (map-get? skill-certificates certificate-id) ERR_NOT_FOUND))
           (review-id (unwrap! (safe-add certificate-id (unwrap! (safe-mul u1000000 (len (get peer-reviews certificate))) ERR_OVERFLOW)) ERR_OVERFLOW)))
         (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
+        (asserts! (not (is-blacklisted tx-sender)) ERR-BLACKLISTED)
         (try! (check-rate-limit tx-sender))
         (asserts! (not (is-eq tx-sender (get owner certificate))) ERR_SELF_REVIEW)
         (asserts! (is-none (map-get? user-reviews {reviewer: tx-sender, certificate-id: certificate-id})) ERR_ALREADY_REVIEWED)
@@ -339,51 +506,6 @@
         (try! (nft-mint? skill-certificate certificate-id tx-sender))
         (ok certificate-id)))
 
-;; Create employer bounty for specific skills
-(define-public (create-skill-bounty (title (string-ascii 128))
-                                   (description (string-ascii 512))
-                                   (required-skills (list 10 (string-ascii 64)))
-                                   (reward-amount uint))
-    (let ((bounty-id (var-get next-bounty-id)))
-        (asserts! (not (var-get contract-paused)) ERR_CONTRACT_PAUSED)
-        (try! (check-rate-limit tx-sender))
-        (try! (validate-string-not-empty-128 title))
-        (asserts! (> reward-amount u0) ERR_INVALID_BOUNTY)
-        (asserts! (> (len required-skills) u0) ERR_INVALID_BOUNTY)
-        
-        ;; Transfer reward to contract (simplified - in real implementation would use escrow)
-        (try! (stx-transfer? reward-amount tx-sender (as-contract tx-sender)))
-        
-        (map-set skill-bounties bounty-id {
-            employer: tx-sender,
-            title: title,
-            description: description,
-            required-skills: required-skills,
-            reward-amount: reward-amount,
-            is-active: true,
-            winner: none,
-            created-at: stacks-block-height
-        })
-        
-        (var-set next-bounty-id (unwrap! (safe-add bounty-id u1) ERR_OVERFLOW))
-        (ok bounty-id)))
-
-;; Claim bounty if user has required skills
-(define-public (claim-bounty (bounty-id uint))
-    (let ((bounty (unwrap! (map-get? skill-bounties bounty-id) ERR_NOT_FOUND)))
-        (asserts! (get is-active bounty) ERR_NOT_FOUND)
-        (asserts! (has-all-skills (get required-skills bounty) tx-sender) ERR_NOT_AUTHORIZED)
-        
-        ;; Update bounty status
-        (map-set skill-bounties bounty-id (merge bounty {
-            is-active: false,
-            winner: (some tx-sender)
-        }))
-        
-        ;; Transfer reward to winner
-        (try! (as-contract (stx-transfer? (get reward-amount bounty) tx-sender tx-sender)))
-        (ok true)))
-
 ;; Refresh expired skill certification
 (define-public (refresh-certification (certificate-id uint))
     (let ((certificate (unwrap! (map-get? skill-certificates certificate-id) ERR_NOT_FOUND)))
@@ -416,10 +538,6 @@
 (define-read-only (get-peer-review (review-id uint))
     (map-get? peer-reviews review-id))
 
-;; Get bounty details
-(define-read-only (get-bounty (bounty-id uint))
-    (map-get? skill-bounties bounty-id))
-
 ;; Check if skill is still valid (not expired)
 (define-read-only (is-skill-valid (certificate-id uint))
     (match (map-get? skill-certificates certificate-id)
@@ -435,12 +553,36 @@
   (var-get contract-paused)
 )
 
+(define-read-only (is-emergency-mode-enabled)
+  (var-get emergency-mode)
+)
+
+(define-read-only (is-user-admin (user principal))
+  (is-admin user)
+)
+
+(define-read-only (is-user-blacklisted (user principal))
+  (is-blacklisted user)
+)
+
 (define-read-only (get-last-operation-block (user principal))
   (default-to u0 (map-get? last-operation-block user))
 )
 
 (define-read-only (get-operations-count (user principal) (block uint))
   (default-to u0 (map-get? operations-per-block {user: user, block: block}))
+)
+
+(define-read-only (get-min-reviews-required)
+  (var-get min-reviews-required)
+)
+
+(define-read-only (get-max-stake-amount)
+  (var-get max-stake-amount)
+)
+
+(define-read-only (get-platform-fee)
+  (var-get platform-fee)
 )
 
 ;; NFT trait implementations
